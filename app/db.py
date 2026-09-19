@@ -216,6 +216,54 @@ def init_db(path: Path | None = None) -> None:
                 delivered_at       TEXT NOT NULL,
                 response_body      TEXT NOT NULL    -- 首次投递响应的原始 JSON 文本
             );
+
+            -- 可复用 DAG 模板：name 为唯一业务键。模板只承载发布元数据；
+            -- 任务图快照保存在 dag_template_versions 中，每个已发布版本不可变。
+            CREATE TABLE IF NOT EXISTS dag_templates (
+                name          TEXT PRIMARY KEY,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL         -- 最近一次发布版本的时刻
+            );
+
+            -- 模板版本：(name, version) 唯一。tasks 为发布时固化的不可变任务图
+            -- JSON 快照（与 POST /dags 提交体同构），parameters 为从各任务
+            -- payload 中提取的 ${name} 占位符名（去重排序）JSON 数组。
+            -- 行由触发器禁止 UPDATE/DELETE：已发布快照永远不可修改，只能发布新版本。
+            CREATE TABLE IF NOT EXISTS dag_template_versions (
+                name          TEXT NOT NULL REFERENCES dag_templates(name),
+                version       INTEGER NOT NULL CHECK (version >= 1),
+                tasks         TEXT NOT NULL,       -- 不可变任务图快照（规范化后的任务 JSON）
+                parameters    TEXT NOT NULL,       -- 占位符名 JSON 数组，可能为 []
+                task_count    INTEGER NOT NULL,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (name, version)
+            );
+
+            -- 实例化幂等记录：(模板名, 版本, idempotency_key) 唯一标识一次逻辑实例化。
+            -- 首次实例化在 DAG 创建的同一事务内写入参数规范化指纹与新 DAG id；
+            -- 同键重复调用直接返回首次创建的 DAG，指纹不同则 409。
+            CREATE TABLE IF NOT EXISTS dag_template_instantiations (
+                name             TEXT NOT NULL,
+                version          INTEGER NOT NULL,
+                idempotency_key  TEXT NOT NULL,
+                parameters       TEXT NOT NULL,    -- 参数规范化 JSON 指纹（排序键）
+                dag_id           TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                PRIMARY KEY (name, version, idempotency_key),
+                FOREIGN KEY (name, version) REFERENCES dag_template_versions(name, version)
+            );
+
+            -- 已发布版本快照不可变：任何 UPDATE/DELETE 都被中止
+            CREATE TRIGGER IF NOT EXISTS dag_template_versions_no_update
+            BEFORE UPDATE ON dag_template_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'template version snapshot is immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS dag_template_versions_no_delete
+            BEFORE DELETE ON dag_template_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'template version snapshot is immutable');
+            END;
             """
         )
 

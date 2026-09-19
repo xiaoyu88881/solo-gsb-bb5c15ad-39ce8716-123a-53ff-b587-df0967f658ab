@@ -11,11 +11,15 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import Response, JSONResponse
 
 from . import service
+from . import templates
 from .db import init_db
 from .schemas import (
     ClaimIn,
     CompleteIn,
     DAGSubmitIn,
+    DAGTemplateIn,
+    DAGTemplateInstantiateIn,
+    DAGTemplateVersionIn,
     HeartbeatIn,
     SubscriptionAckIn,
     SubscriptionIn,
@@ -32,8 +36,8 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Dependency-Aware Task Lease API",
-    version="1.1.0",
-    description="提交 DAG、原子领取前置已完成的任务、基于租约令牌回报结果；支持工作器能力登记与 requires 能力路由。",
+    version="1.2.0",
+    description="提交 DAG、原子领取前置已完成的任务、基于租约令牌回报结果；支持工作器能力登记与 requires 能力路由；提供可复用 DAG 模板（不可变版本快照与参数化实例化）。",
     lifespan=lifespan,
 )
 
@@ -64,6 +68,77 @@ def get_dag(dag_id: str) -> dict:
 @app.get("/dags/{dag_id}/analysis")
 def analyze_dag(dag_id: str) -> dict:
     return service.analyze_dag(dag_id)
+
+
+# ------------------------------------------------------- 可复用 DAG 模板
+
+@app.post(
+    "/templates",
+    status_code=201,
+    summary="创建可复用 DAG 模板（同时发布不可变第 1 版）",
+    responses={
+        201: {"description": "模板已创建并固化第 1 版任务图快照"},
+        409: {"description": "模板名称已存在（template_exists）"},
+        422: {"description": "任务图不合法（复用 POST /dags 的全部图校验）"},
+    },
+)
+def create_template(body: DAGTemplateIn) -> dict:
+    return templates.create_template(body.model_dump())
+
+
+@app.get("/templates", summary="模板列表")
+def list_templates() -> dict:
+    return templates.list_templates()
+
+
+@app.get(
+    "/templates/{name}",
+    summary="模板详情（含全部版本摘要）",
+    responses={404: {"description": "模板不存在（template_not_found）"}},
+)
+def get_template(name: str) -> dict:
+    return templates.get_template(name)
+
+
+@app.post(
+    "/templates/{name}/versions",
+    status_code=201,
+    summary="按名称发布下一个不可变版本",
+    responses={
+        201: {"description": "新版本快照已固化；版本号在事务内递增"},
+        404: {"description": "模板不存在（template_not_found）"},
+        422: {"description": "任务图不合法（复用 POST /dags 的全部图校验）"},
+    },
+)
+def publish_template_version(name: str, body: DAGTemplateVersionIn) -> dict:
+    return templates.publish_template_version(name, body.model_dump())
+
+
+@app.get(
+    "/templates/{name}/versions/{version}",
+    summary="查询指定版本的不可变任务图快照",
+    responses={
+        404: {"description": "模板或版本不存在（template_not_found/template_version_not_found）"},
+    },
+)
+def get_template_version(name: str, version: int) -> dict:
+    return templates.get_template_version(name, version)
+
+
+@app.post(
+    "/templates/{name}/versions/{version}/instantiate",
+    summary="用参数实例化模板版本（幂等）",
+    responses={
+        200: {"description": "同模板版本 + idempotency_key 重复且参数等价：返回首次创建的同一 DAG"},
+        201: {"description": "已创建新 DAG"},
+        404: {"description": "模板或版本不存在（template_not_found/template_version_not_found）"},
+        409: {"description": "同模板版本 + idempotency_key 参数不同（idempotency_conflict）；或并发组持久化上限冲突"},
+        422: {"description": "参数缺键（missing_template_parameter）或多键（unexpected_template_parameter）；图校验失败"},
+    },
+)
+def instantiate_template(name: str, version: int, body: DAGTemplateInstantiateIn):
+    status_code, dag = templates.instantiate_template(name, version, body.model_dump())
+    return JSONResponse(status_code=status_code, content=dag)
 
 
 @app.post(

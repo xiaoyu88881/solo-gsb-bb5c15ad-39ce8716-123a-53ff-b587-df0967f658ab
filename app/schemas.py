@@ -64,6 +64,33 @@ class DAGSubmitIn(BaseModel):
     id: str | None = Field(None, description="可选自定义 DAG id；已存在则返回 409")
 
 
+class DAGTemplateIn(BaseModel):
+    """创建可复用 DAG 模板：名称唯一，创建即发布不可变的第 1 版。"""
+
+    name: str = Field(..., min_length=1, description="模板名称（唯一业务键）；重名返回 409")
+    tasks: list[TaskIn] = Field(..., min_length=1, description="第 1 版的不可变任务图快照")
+
+
+class DAGTemplateVersionIn(BaseModel):
+    """按名称为已有模板发布下一个不可变版本。"""
+
+    tasks: list[TaskIn] = Field(..., min_length=1, description="新版本的不可变任务图快照")
+
+
+class DAGTemplateInstantiateIn(BaseModel):
+    """用参数实例化指定模板版本：参数键须与快照 payload 占位符恰好一一对应。"""
+
+    idempotency_key: str = Field(
+        ...,
+        min_length=1,
+        description="客户端生成的幂等键；同模板版本 + 键的等价请求只创建一个 DAG",
+    )
+    parameters: dict[str, str | int | float | bool | None | list | dict] = Field(
+        default_factory=dict,
+        description="替换任务 payload 中 ${name} 占位符的参数；缺键或多键均 422",
+    )
+
+
 class ClaimIn(BaseModel):
     worker_id: str | None = None
     dag_id: str | None = None
