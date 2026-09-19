@@ -216,6 +216,42 @@ def init_db(path: Path | None = None) -> None:
                 delivered_at       TEXT NOT NULL,
                 response_body      TEXT NOT NULL    -- 首次投递响应的原始 JSON 文本
             );
+
+            -- ------------------------------------------------------- 可复用 DAG 模板
+            -- 模板只承载定义（名称与时间戳）；任务图的不可变快照按版本保存在
+            -- dag_template_versions：发布后版本行（含 snapshot_json）永不更新。
+            CREATE TABLE IF NOT EXISTS dag_templates (
+                name          TEXT PRIMARY KEY,     -- 模板名（创建后不可改）
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL          -- 最近一次发布新版本的时刻
+            );
+
+            -- 已发布版本：每个版本保存发布时刻的任务图快照（JSON 文本，不可变）。
+            -- version 在同一模板内从 1 起单调递增；snapshot 不随后续发布而改变。
+            -- parameters 为发布时从任务 payload 中提取的 ${name} 占位符名集合（
+            -- 去重排序后的 JSON 数组），实例化时用于缺参/多参校验。
+            CREATE TABLE IF NOT EXISTS dag_template_versions (
+                template_name  TEXT NOT NULL REFERENCES dag_templates(name),
+                version        INTEGER NOT NULL CHECK (version >= 1),
+                snapshot_json  TEXT NOT NULL,        -- 发布时规范化的任务定义数组（不可变）
+                parameters     TEXT NOT NULL,        -- JSON 数组字符串：占位符名（去重排序）
+                created_at     TEXT NOT NULL,
+                PRIMARY KEY (template_name, version)
+            );
+
+            -- 模板实例化幂等记录：(模板名, 版本, idempotency_key) 唯一标识一次
+            -- 逻辑实例化。首次请求在「校验/替换/DAG 创建」的同一事务内写入参数
+            -- 规范化指纹与创建出的 dag_id；同键同参重复调用返回同一 DAG，
+            -- 同键参数指纹不同返回 409；任何 422/409 路径回滚，不留记录也不留 DAG。
+            CREATE TABLE IF NOT EXISTS dag_template_instantiations (
+                template_name    TEXT NOT NULL,
+                version          INTEGER NOT NULL,
+                idempotency_key  TEXT NOT NULL,
+                dag_id           TEXT NOT NULL REFERENCES dags(id),
+                parameters_json  TEXT NOT NULL,      -- 规范化参数 JSON（等价判定指纹）
+                created_at       TEXT NOT NULL,
+                PRIMARY KEY (template_name, version, idempotency_key)
+            );
             """
         )
 

@@ -119,6 +119,29 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   `GET /subscriptions`（可按 `dag_id` 过滤）与 `GET /subscriptions/{id}`
   （含在途批次及其 `expired` 状态）查询。该模块只复用 `events.sequence`，
   不改变既有 `/events` 与任务接口的任何行为。
+- **可复用 DAG 模板（版本化快照与参数化实例化）**：`POST /templates` 按名称创建
+  模板并立即发布**不可变版本 1**（模板名重复 `409 template_exists`）；
+  `POST /templates/{name}/versions` 按名称发布新版本，版本号在模板内从 1 起
+  单调递增，每个版本独立保存发布时刻的任务图快照（JSON），**发布后永不更新**
+  （后续发布不影响旧版本；另有 `GET /templates`、`GET /templates/{name}` 与
+  `GET /templates/{name}/versions/{version}` 查询版本与快照）。创建/发布的图
+  校验（重复键、缺失依赖、环、同批并发组矛盾）**完全复用直接
+  `POST /dags` 的校验口径与错误码**（422），非法请求不产生模板/版本。
+  `POST /templates/{name}/versions/{version}/instantiations` 用调用方参数
+  实例化版本：任务 **payload 值**中的 `${name}` 占位符被实参替换（对象键不替换；
+  值整体恰为一个占位符时保留实参原类型，嵌入更长字符串时按文本替换）。
+  实参集合必须与版本中提取出的占位符集合**一一对应**：缺参
+  （`422 missing_template_parameter`）或多参（`422 unexpected_template_parameter`）
+  一律拒绝且**不落库**。实例化必须携带非空 `idempotency_key`：相同
+  **模板 + 版本 + 键**且参数等价（JSON 键序不影响等价判定）的重复调用返回首次
+  创建的**同一 DAG**（首次 `201`，重放 `200`，响应结构与 `GET /dags/{id}` 一致）；
+  同键但参数不同返回 `409 idempotency_conflict`。**参数校验、占位符替换、
+  DAG 图校验/落库（含跨 DAG 并发组冲突检测与 `dag.created` 事件）与幂等记录
+  写入在单个 SQLite 事务内完成**——任何 422/409 整体回滚，不留 DAG、事件或
+  幂等记录；模板/版本不存在分别返回 404 `template_not_found` /
+  `template_version_not_found`。模板、快照与幂等记录均持久化在 SQLite 中，
+  重启后重放与冲突语义不变。该模块只复用 DAG 校验、落库与响应结构，
+  **不改变直接 `POST /dags` 的任何行为**（直接提交不做占位符替换）。
 - **状态接口**：DAG 概览给出各状态计数；任务详情列出每次尝试的状态、租约令牌、
   过期时间、心跳时间、错误信息，以及当前租约是否已过期和阻塞原因。
 - **只读分析**：`GET /dags/{dag_id}/analysis` 按任务声明的 `duration_seconds`
@@ -699,6 +722,87 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
   存储数据中出现非正 `duration_seconds` → `422 invalid_duration`，
   图异常（环、悬空依赖）→ `422 cycle_detected` / `422 missing_dependency`。
 
+### 12. 可复用 DAG 模板（版本发布与参数化实例化）
+
+创建模板（立即发布不可变版本 1），随后按名称发布新版本；每个版本保存发布时的
+任务图快照，实例化时用参数替换任务 payload 中的 `${name}` 占位符：
+
+```bash
+# 创建模板并发布版本 1（payload 值中的 ${name} 即占位符；图非法同样 422）
+curl -s -X POST http://localhost:8000/templates \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "nightly-etl",
+    "tasks": [
+      {"key": "extract", "payload": {"source": "${source}", "rows": "${rows}",
+                                     "path": "s3://${bucket}/data"}},
+      {"key": "load", "deps": ["extract"], "requires": ["io"], "max_retries": 2}
+    ]
+  }' | jq
+# {
+#   "template_name": "nightly-etl", "version": 1, "task_count": 2,
+#   "parameters": ["bucket", "rows", "source"],
+#   "created_at": "2026-09-19T10:00:00Z",
+#   "snapshot": [ …发布时规范化的任务定义，之后不可变… ]
+# }
+
+# 按名称发布新版本（版本号自动递增；旧版本快照不受影响）
+curl -s -X POST http://localhost:8000/templates/nightly-etl/versions \
+  -H 'Content-Type: application/json' \
+  -d '{"tasks": [
+        {"key": "extract", "payload": {"source": "${source}"}},
+        {"key": "verify", "deps": ["extract"]},
+        {"key": "load", "deps": ["verify"], "requires": ["io"]}
+      ]}' | jq
+# -> 201 {"version": 2, "parameters": ["source"], …}
+
+# 查询：模板列表 / 模板详情（全部版本元数据）/ 单个版本（含不可变快照）
+curl -s http://localhost:8000/templates | jq
+curl -s http://localhost:8000/templates/nightly-etl | jq
+curl -s http://localhost:8000/templates/nightly-etl/versions/1 | jq
+
+# 实例化版本 1：必须携带 idempotency_key，参数与占位符集合一一对应
+curl -s -X POST http://localhost:8000/templates/nightly-etl/versions/1/instantiations \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key": "2026-09-19-nightly",
+       "parameters": {"source": "orders-db", "rows": 5000, "bucket": "etl-prod"}}' | jq
+# -> 201，响应体与 GET /dags/{id} 完全一致；extract 的 payload 替换为：
+#    {"source": "orders-db", "rows": 5000, "path": "s3://etl-prod/data"}
+# 整体占位符保留实参类型（rows 仍是数字）；嵌入占位符按文本替换。
+
+# 同模板版本 + 同键 + 等价参数重复调用 -> 200，返回首次创建的同一 DAG（同一 id）
+curl -s -X POST http://localhost:8000/templates/nightly-etl/versions/1/instantiations \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key": "2026-09-19-nightly",
+       "parameters": {"rows": 5000, "bucket": "etl-prod", "source": "orders-db"}}'
+# -> 200（JSON 键序不影响参数等价判定）
+
+# 缺参 / 多参 -> 422 且不落库（无 DAG、无事件、无幂等记录）
+#   {"error":{"code":"missing_template_parameter",
+#             "details":{"missing":["bucket"], "required":[…]}}}
+#   {"error":{"code":"unexpected_template_parameter",
+#             "details":{"unexpected":["extra"], "required":[…]}}}
+# 同键但参数不同 -> 409
+#   {"error":{"code":"idempotency_conflict",
+#             "details":{"template_name":"nightly-etl","version":1,
+#                        "idempotency_key":"2026-09-19-nightly"}}}
+# 模板 / 版本不存在 -> 404 template_not_found / template_version_not_found
+```
+
+要点：
+
+- **不可变快照**：每个版本保存发布时规范化的完整任务定义（含 `deps`、`requires`、
+  重试/退避/并发组等全部字段），之后的发布、实例化都不会修改它；实例化发生在
+  快照的副本上。`parameters` 为发布时从任务 payload **值**中提取并排序去重的
+  占位符名（`${合法标识符}`；对象键与 `${}`、`${1a}` 等非法形态不视为占位符）。
+- **单事务原子性**：参数校验 → 占位符替换 → DAG 图校验 → DAG/任务/事件落库 →
+  幂等记录写入，全部在同一个 `BEGIN IMMEDIATE` 事务内完成；任一步失败整体回滚，
+  绝不留下半个 DAG 或抢先写入的幂等记录。跨 DAG 并发组上限冲突同样整批回滚。
+- **幂等作用域**：幂等键的唯一作用域是 `(模板名, 版本号, idempotency_key)`；
+  不同版本或不同模板可复用同一个键。实例化支持可选 `name`（实例 DAG 名称，
+  缺省用模板名）与 `id`（自定义 DAG id，已存在则 `409 dag_exists` 回滚，
+  不占幂等键）。
+
 状态变迁与事件 `type` 的对应关系：
 
 | 业务动作 | 事件 type | from_state → to_state |
@@ -720,6 +824,12 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 | `POST` | `/dags` | 提交 DAG（校验缺失依赖与环） |
 | `GET` | `/dags/{dag_id}` | DAG 概览：状态计数与任务列表 |
 | `GET` | `/dags/{dag_id}/analysis` | 只读分析：最早/最晚时间、总工期、关键路径与并行层级 |
+| `POST` | `/templates` | 创建 DAG 模板并发布不可变版本 1（重名 409；图非法 422） |
+| `GET` | `/templates` | 模板列表（名称、时间戳、版本数与最新版本） |
+| `GET` | `/templates/{name}` | 模板详情：全部已发布版本的元数据（不存在 404） |
+| `POST` | `/templates/{name}/versions` | 按名称发布新版本：版本号递增并保存不可变任务图快照（模板不存在 404；图非法 422） |
+| `GET` | `/templates/{name}/versions/{version}` | 查询指定版本：元数据 + 不可变快照（版本不存在 404） |
+| `POST` | `/templates/{name}/versions/{version}/instantiations` | 参数化实例化（替换 payload 中的 `${name}`）；必须携带 idempotency_key，同键同参返回同一 DAG、参数不同 409、缺参/多参 422 |
 | `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（同事务校验能力登记；跳过满并发组与能力不匹配候选，尽量填满 limit；登记缺失/过期 409） |
 | `PUT` | `/workers/{worker_id}` | 登记/刷新工作器能力：去重能力标签 + 正数 ttl_seconds；重复 PUT 覆盖能力并刷新过期时刻 |
 | `GET` | `/workers/{worker_id}` | 查询登记内容与 alive 存活状态；从未登记 404 |
@@ -797,4 +907,15 @@ OpenAPI 文档包含取消接口）、
 返回 409、ack 仅认当前令牌并把游标推进到该批最后一条 sequence、无在途批次/错误
 令牌返回 409 且游标不动、空批次无令牌不占槽位、不可能越过未确认事件、订阅列表与
 详情含在途 expired 状态、订阅/在途批次/游标重启后持久化且语义不变、与既有
-GET /events 及任务接口并存且行为不变、OpenAPI 文档包含订阅接口）。
+GET /events 及任务接口并存且行为不变、OpenAPI 文档包含订阅接口）、
+可复用 DAG 模板（创建即发布版本 1、重名 409、创建/发布复用 DAG 图校验错误码
+且失败不写库、按名称发布版本号递增、旧版本快照不可变、模板/版本列表与详情
+查询、404 与非整数版本号路径、占位符从 payload 值提取且不替换对象键、非法
+占位符形态按字面保留、整体占位符保留实参类型与嵌入文本替换、嵌套 payload
+替换、缺参 422 与多参 422 均不落 DAG/事件/幂等记录、无占位符版本只接受空参数、
+实例化 DAG 与直接提交同结构且依赖/requires/并发组生效、幂等键必填、同键等价
+参数（含键序差异）重放返回同一 DAG 且只产生一次 dag.created、同键参数不同
+409、幂等作用域按模板与版本隔离、缺参重放不返回首响、自定义 name/id 与已存在
+id 409 回滚不占键、跨 DAG 并发组冲突整体回滚、并发同键异参只创建一个 DAG、
+并发同键同参 200/201 同一 DAG、模板/快照/幂等记录重启后持久化且语义不变、
+直接 POST /dags 行为与响应结构不变、OpenAPI 文档包含模板接口）。

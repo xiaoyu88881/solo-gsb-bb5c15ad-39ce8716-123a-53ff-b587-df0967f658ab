@@ -5,6 +5,7 @@ from __future__ import annotations
 import heapq
 import json
 import math
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -162,11 +163,18 @@ def _find_cycle(keys: set[str], deps: dict[str, list[str]]) -> list[str]:
     return []
 
 
-def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
-    raw_tasks = body["tasks"]
-    name = body.get("name") or "dag"
-    dag_id = body.get("id") or uuid.uuid4().hex
+def _prepare_dag_tasks(raw_tasks: list[dict[str, Any]]) -> tuple[
+    list[str],
+    dict[str, list[str]],
+    dict[str, dict[str, Any]],
+    dict[str, int],
+]:
+    """复用的 DAG 提交前校验：重复键 / 缺失依赖 / 环 / 同批并发组矛盾。
 
+    纯内存、不触库：直接 POST /dags 与模板版本发布共用同一套图校验口径。
+    返回 (有序 key 列表, 依赖映射, key->任务定义, 并发组名->上限)。
+    校验失败抛 422 APIError（与 submit_dag 原行为一致）。
+    """
     keys: list[str] = []
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -200,10 +208,6 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
     if cycle:
         raise APIError(422, "cycle_detected", "依赖图存在环，必须是 DAG", {"cycle": cycle})
 
-    default_lease = get_default_lease_seconds()
-    default_duration = get_default_duration_seconds()
-    now = _iso(_now())
-
     # 本次提交声明的并发组：同名组在同一批任务中必须声明相同上限，
     # 否则整批拒绝（请求自身矛盾，422）。
     declared: dict[str, int] = {}
@@ -225,79 +229,113 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
             )
         declared[group] = limit
 
-    with get_conn() as conn:
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT INTO dags (id, name, created_at) VALUES (?, ?, ?)",
-                (dag_id, name, now),
+    return keys, deps_map, tasks_by_key, declared
+
+
+def _persist_dag(
+    conn,
+    dag_id: str,
+    name: str,
+    keys: list[str],
+    deps_map: dict[str, list[str]],
+    tasks_by_key: dict[str, dict[str, Any]],
+    declared: dict[str, int],
+    now: str,
+) -> None:
+    """在调用方已开启的写事务内插入 DAG、并发组、dag.created 事件、任务与依赖边。
+
+    不自行提交/回滚：直接提交与模板实例化共用同一落库路径，后者必须把幂等记录
+    与这些行放在同一个事务内。dags 主键冲突就近转成 409 dag_exists APIError；
+    并发组持久化上限冲突抛 409 APIError；其余异常原样抛出——调用方统一回滚。
+    """
+    # DAG 主键冲突就近转 409（调用方负责回滚整个事务）；其余 IntegrityError
+    # （如并发组竞争）不在此吞，以保留原始错误语义
+    try:
+        conn.execute(
+            "INSERT INTO dags (id, name, created_at) VALUES (?, ?, ?)",
+            (dag_id, name, now),
+        )
+    except sqlite3.IntegrityError:
+        raise APIError(409, "dag_exists", f"DAG id {dag_id} 已存在")
+
+    # 跨 DAG 一致性：同名组的上限首次声明即持久化，之后必须一致。
+    # 冲突在插入任何任务行之前检出，整体回滚，不留 DAG/任务/事件痕迹。
+    for group, limit in declared.items():
+        existing = conn.execute(
+            "SELECT limit_value FROM concurrency_groups WHERE name = ?",
+            (group,),
+        ).fetchone()
+        if existing is not None and existing["limit_value"] != limit:
+            raise APIError(
+                409,
+                "concurrency_group_conflict",
+                f"并发组 {group} 已持久化上限 {existing['limit_value']}，与本次声明 {limit} 冲突",
+                {
+                    "group": group,
+                    "existing_limit": existing["limit_value"],
+                    "submitted_limit": limit,
+                },
             )
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise APIError(409, "dag_exists", f"DAG id {dag_id} 已存在")
+        if existing is None:
+            conn.execute(
+                "INSERT INTO concurrency_groups (name, limit_value, created_at) VALUES (?, ?, ?)",
+                (group, limit, now),
+            )
 
+    default_lease = get_default_lease_seconds()
+    default_duration = get_default_duration_seconds()
+
+    # dag.created 与 DAG/任务行同事务：创建失败（回滚）不留事件；
+    # 可空字段 task_id/attempt/from_state/to_state 一律为 NULL
+    _append_event(conn, EVT_DAG_CREATED, dag_id, now)
+    for key in keys:
+        t = tasks_by_key[key]
+        lease = float(t.get("lease_seconds") or default_lease)
+        duration = float(t.get("duration_seconds") or default_duration)
+        backoff = t.get("retry_backoff")
+        conn.execute(
+            """INSERT INTO tasks (id, dag_id, task_key, name, payload,
+                   max_retries, lease_seconds, duration_seconds, state, attempt,
+                   created_at, concurrency_group, requires,
+                   backoff_initial_seconds, backoff_multiplier, backoff_max_seconds)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
+            (
+                uuid.uuid4().hex,
+                dag_id,
+                key,
+                t.get("name") or key,
+                _dumps(t.get("payload")),
+                int(t.get("max_retries") or 0),
+                lease,
+                duration,
+                PENDING,
+                now,
+                t.get("concurrency_group"),
+                _dumps(t.get("requires")),
+                float(backoff["initial_seconds"]) if backoff else None,
+                float(backoff["multiplier"]) if backoff else None,
+                float(backoff["max_seconds"]) if backoff else None,
+            ),
+        )
+        for dep in deps_map[key]:
+            conn.execute(
+                "INSERT INTO dependencies (dag_id, task_key, dep_key) VALUES (?, ?, ?)",
+                (dag_id, key, dep),
+            )
+
+
+def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
+    raw_tasks = body["tasks"]
+    name = body.get("name") or "dag"
+    dag_id = body.get("id") or uuid.uuid4().hex
+
+    keys, deps_map, tasks_by_key, declared = _prepare_dag_tasks(raw_tasks)
+    now = _iso(_now())
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            # 跨 DAG 一致性：同名组的上限首次声明即持久化，之后必须一致。
-            # 冲突在插入任何任务行之前检出，整体回滚，不留 DAG/任务/事件痕迹。
-            for group, limit in declared.items():
-                existing = conn.execute(
-                    "SELECT limit_value FROM concurrency_groups WHERE name = ?",
-                    (group,),
-                ).fetchone()
-                if existing is not None and existing["limit_value"] != limit:
-                    raise APIError(
-                        409,
-                        "concurrency_group_conflict",
-                        f"并发组 {group} 已持久化上限 {existing['limit_value']}，与本次声明 {limit} 冲突",
-                        {
-                            "group": group,
-                            "existing_limit": existing["limit_value"],
-                            "submitted_limit": limit,
-                        },
-                    )
-                if existing is None:
-                    conn.execute(
-                        "INSERT INTO concurrency_groups (name, limit_value, created_at) VALUES (?, ?, ?)",
-                        (group, limit, now),
-                    )
-
-            # dag.created 与 DAG/任务行同事务：创建失败（回滚）不留事件；
-            # 可空字段 task_id/attempt/from_state/to_state 一律为 NULL
-            _append_event(conn, EVT_DAG_CREATED, dag_id, now)
-            for key in keys:
-                t = tasks_by_key[key]
-                lease = float(t.get("lease_seconds") or default_lease)
-                duration = float(t.get("duration_seconds") or default_duration)
-                backoff = t.get("retry_backoff")
-                conn.execute(
-                    """INSERT INTO tasks (id, dag_id, task_key, name, payload,
-                           max_retries, lease_seconds, duration_seconds, state, attempt,
-                           created_at, concurrency_group, requires,
-                           backoff_initial_seconds, backoff_multiplier, backoff_max_seconds)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        uuid.uuid4().hex,
-                        dag_id,
-                        key,
-                        t.get("name") or key,
-                        _dumps(t.get("payload")),
-                        int(t.get("max_retries") or 0),
-                        lease,
-                        duration,
-                        PENDING,
-                        now,
-                        t.get("concurrency_group"),
-                        _dumps(t.get("requires")),
-                        float(backoff["initial_seconds"]) if backoff else None,
-                        float(backoff["multiplier"]) if backoff else None,
-                        float(backoff["max_seconds"]) if backoff else None,
-                    ),
-                )
-                for dep in deps_map[key]:
-                    conn.execute(
-                        "INSERT INTO dependencies (dag_id, task_key, dep_key) VALUES (?, ?, ?)",
-                        (dag_id, key, dep),
-                    )
+            _persist_dag(conn, dag_id, name, keys, deps_map, tasks_by_key, declared, now)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")

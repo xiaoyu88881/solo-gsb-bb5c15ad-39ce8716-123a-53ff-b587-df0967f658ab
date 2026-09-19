@@ -131,3 +131,36 @@ class WorkerRegisterIn(BaseModel):
         allow_inf_nan=False,
         description="登记存活时长（秒，必须为正）：过期前该 worker_id 的领取才视为携带存活登记；重复登记会刷新过期时刻",
     )
+
+
+# ------------------------------------------------------- 可复用 DAG 模板
+
+class TemplateCreateIn(BaseModel):
+    """创建模板：名称 + 首版任务图（复用 DAG 提交校验，创建即发布不可变版本 1）。"""
+
+    name: str = Field(..., min_length=1, description="模板名称（全局唯一；重复创建 409）")
+    tasks: list[TaskIn] = Field(..., min_length=1, description="版本 1 的任务定义；payload 中可含 ${name} 占位符")
+
+
+class TemplateVersionPublishIn(BaseModel):
+    """按名称发布新版本：版本号由服务端在模板内递增，任务图快照不可变。"""
+
+    tasks: list[TaskIn] = Field(
+        ..., min_length=1, description="新版本的任务定义；payload 中可含 ${name} 占位符"
+    )
+
+
+class TemplateInstantiateIn(BaseModel):
+    """实例化指定模板版本：必填幂等键 + 占位符参数（缺参/多参均 422）。"""
+
+    idempotency_key: str = Field(
+        ...,
+        min_length=1,
+        description="客户端生成的幂等键：同模板版本 + 同键返回首次创建的同一 DAG；同键参数不同 409",
+    )
+    parameters: dict[str, str | int | float | bool | None | list | dict] = Field(
+        default_factory=dict,
+        description="占位符实参：键须与版本 payload 中的 ${name} 集合一一对应，缺参或多参 422",
+    )
+    name: str | None = Field(None, min_length=1, description="可选：实例 DAG 名称；缺省用模板名")
+    id: str | None = Field(None, description="可选自定义 DAG id；已存在则返回 409")

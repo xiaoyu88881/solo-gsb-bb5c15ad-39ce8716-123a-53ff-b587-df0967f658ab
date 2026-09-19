@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import Response, JSONResponse
 
-from . import service
+from . import service, templates
 from .db import init_db
 from .schemas import (
     ClaimIn,
@@ -20,6 +20,9 @@ from .schemas import (
     SubscriptionAckIn,
     SubscriptionIn,
     SubscriptionPollIn,
+    TemplateCreateIn,
+    TemplateInstantiateIn,
+    TemplateVersionPublishIn,
     WorkerRegisterIn,
 )
 
@@ -32,8 +35,8 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Dependency-Aware Task Lease API",
-    version="1.1.0",
-    description="提交 DAG、原子领取前置已完成的任务、基于租约令牌回报结果；支持工作器能力登记与 requires 能力路由。",
+    version="1.2.0",
+    description="提交 DAG、原子领取前置已完成的任务、基于租约令牌回报结果；支持工作器能力登记与 requires 能力路由；提供可复用 DAG 模板（版本化快照与参数化实例化）。",
     lifespan=lifespan,
 )
 
@@ -64,6 +67,79 @@ def get_dag(dag_id: str) -> dict:
 @app.get("/dags/{dag_id}/analysis")
 def analyze_dag(dag_id: str) -> dict:
     return service.analyze_dag(dag_id)
+
+
+# ------------------------------------------------------- 可复用 DAG 模板
+
+@app.post(
+    "/templates",
+    status_code=201,
+    summary="创建 DAG 模板（同时发布不可变版本 1）",
+    responses={
+        201: {"description": "模板已创建并发布版本 1，返回版本元数据与任务图快照"},
+        409: {"description": "模板名已存在（template_exists）"},
+        422: {"description": "任务图非法：重复键/缺失依赖/环/并发组矛盾，复用 DAG 提交校验"},
+    },
+)
+def create_template(body: TemplateCreateIn) -> dict:
+    return templates.create_template(body.model_dump())
+
+
+@app.get("/templates", summary="模板列表")
+def list_templates() -> dict:
+    return templates.list_templates()
+
+
+@app.get(
+    "/templates/{name}",
+    summary="模板详情（含全部已发布版本元数据）",
+    responses={404: {"description": "模板不存在（template_not_found）"}},
+)
+def get_template(name: str) -> dict:
+    return templates.get_template(name)
+
+
+@app.post(
+    "/templates/{name}/versions",
+    status_code=201,
+    summary="按名称发布新版本（保存不可变任务图快照）",
+    responses={
+        201: {"description": "新版本已发布（版本号在模板内递增），返回版本元数据与快照"},
+        404: {"description": "模板不存在（template_not_found）"},
+        422: {"description": "任务图非法：重复键/缺失依赖/环/并发组矛盾，复用 DAG 提交校验"},
+    },
+)
+def publish_template_version(name: str, body: TemplateVersionPublishIn) -> dict:
+    return templates.publish_template_version(name, body.model_dump())
+
+
+@app.get(
+    "/templates/{name}/versions/{version}",
+    summary="查询指定已发布版本（含不可变任务图快照）",
+    responses={
+        200: {"description": "返回版本元数据与发布时保存的任务图快照"},
+        404: {"description": "模板不存在（template_not_found）或版本不存在（template_version_not_found）"},
+    },
+)
+def get_template_version(name: str, version: int) -> dict:
+    return templates.get_template_version(name, version)
+
+
+@app.post(
+    "/templates/{name}/versions/{version}/instantiations",
+    summary="用调用方参数实例化指定模板版本（幂等：同模板版本 + idempotency_key 返回同一 DAG）",
+    responses={
+        201: {"description": "已按参数替换 ${name} 占位符并创建新 DAG"},
+        200: {"description": "幂等命中：返回首次创建的同一 DAG（同键同参重复调用）"},
+        404: {"description": "模板不存在（template_not_found）或版本不存在（template_version_not_found）"},
+        409: {"description": "同 idempotency_key 但参数不同（idempotency_conflict）；自定义 DAG id 已存在（dag_exists）或并发组上限冲突（concurrency_group_conflict）"},
+        422: {"description": "缺少占位符参数（missing_template_parameter）或参数多余（unexpected_template_parameter），不落库"},
+    },
+)
+def instantiate_template(name: str, version: int, body: TemplateInstantiateIn):
+    dag, created = templates.instantiate_template(name, version, body.model_dump())
+    # 首次创建 201；幂等重放 200（返回同一 DAG 视图）
+    return JSONResponse(content=dag, status_code=201 if created else 200)
 
 
 @app.post(

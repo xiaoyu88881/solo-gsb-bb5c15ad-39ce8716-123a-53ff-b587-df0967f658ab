@@ -3114,3 +3114,480 @@ def test_worker_endpoints_in_openapi(client):
     assert "404" in get_op["responses"]
     claim = paths["/tasks/claim"]["post"]
     assert "409" in claim["responses"]
+
+
+# ------------------------------------------------------------- 可复用 DAG 模板
+
+def _make_template(client, name="etl", tasks=None):
+    tasks = tasks or [
+        {"key": "extract",
+         "payload": {"src": "${source}", "count": "${count}", "path": "s3://${bucket}/data"}},
+        {"key": "load", "deps": ["extract"], "requires": ["io"]},
+    ]
+    r = client.post("/templates", json={"name": name, "tasks": tasks})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _instantiate(client, name, version, key, params, **extra):
+    body = {"idempotency_key": key, "parameters": params}
+    body.update(extra)
+    return client.post(f"/templates/{name}/versions/{version}/instantiations", json=body)
+
+
+def _instantiate_named(client, tpl_name, version, key, params, dag_name=None, dag_id=None):
+    body: dict = {"idempotency_key": key, "parameters": params}
+    if dag_name is not None:
+        body["name"] = dag_name
+    if dag_id is not None:
+        body["id"] = dag_id
+    return client.post(f"/templates/{tpl_name}/versions/{version}/instantiations", json=body)
+
+
+def test_template_create_publishes_version_1_with_snapshot(client):
+    tpl = _make_template(client)
+    assert tpl["version"] == 1
+    assert tpl["task_count"] == 2
+    assert tpl["parameters"] == ["bucket", "count", "source"]
+    snap = tpl["snapshot"]
+    assert [t["key"] for t in snap] == ["extract", "load"]
+    # 快照中的任务定义可直接作为 DAG 提交字段（requires 已去重持久化）
+    assert snap[1]["requires"] == ["io"] and snap[1]["deps"] == ["extract"]
+    assert snap[0]["payload"]["src"] == "${source}"
+
+    # 模板列表与详情可见
+    listing = client.get("/templates").json()
+    assert listing["count"] == 1
+    assert listing["templates"][0]["name"] == "etl"
+    assert listing["templates"][0]["latest_version"] == 1
+    assert listing["templates"][0]["version_count"] == 1
+
+    detail = client.get("/templates/etl").json()
+    assert [v["version"] for v in detail["versions"]] == [1]
+    assert detail["versions"][0]["parameters"] == ["bucket", "count", "source"]
+
+
+def test_template_create_duplicate_name_conflict(client):
+    _make_template(client)
+    r = client.post("/templates", json={"name": "etl", "tasks": [{"key": "a"}]})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "template_exists"
+
+
+def test_template_create_validates_graph_like_dag_submit(client):
+    # 复用 DAG 校验：重复键 / 缺失依赖 / 环 一律 422，错误码与 /dags 一致
+    for bad_tasks, code in [
+        ([{"key": "a"}, {"key": "a"}], "duplicate_task_key"),
+        ([{"key": "a", "deps": ["ghost"]}], "missing_dependency"),
+        ([{"key": "a", "deps": ["a"]}], "cycle_detected"),
+    ]:
+        r = client.post("/templates", json={"name": f"bad-{code}", "tasks": bad_tasks})
+        assert r.status_code == 422, r.text
+        assert r.json()["error"]["code"] == code
+    # 校验失败不落库：无模板、无版本、无事件
+    assert client.get("/templates").json()["count"] == 0
+    assert client.get("/events", params={"limit": 100}).json()["events"] == []
+
+
+def test_template_create_requires_nonempty_tasks(client):
+    assert client.post("/templates", json={"name": "empty", "tasks": []}).status_code == 422
+    assert client.post("/templates", json={"name": "noname", "tasks": []}).status_code == 422
+
+
+def test_publish_new_version_by_name(client):
+    tpl = _make_template(client)
+    assert tpl["version"] == 1
+
+    r = client.post("/templates/etl/versions", json={"tasks": [
+        {"key": "extract", "payload": {"src": "${source}"}},
+        {"key": "verify", "deps": ["extract"]},
+        {"key": "load", "deps": ["verify"]},
+    ]})
+    assert r.status_code == 201, r.text
+    v2 = r.json()
+    assert v2["version"] == 2 and v2["parameters"] == ["source"]
+    assert [t["key"] for t in v2["snapshot"]] == ["extract", "verify", "load"]
+
+    detail = client.get("/templates/etl").json()
+    assert detail["latest_version"] == 2 and detail["version_count"] == 2
+    assert [v["version"] for v in detail["versions"]] == [1, 2]
+    assert detail["updated_at"] >= detail["created_at"]
+
+
+def test_publish_version_unknown_template_is_404(client):
+    r = client.post("/templates/ghost/versions", json={"tasks": [{"key": "a"}]})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "template_not_found"
+
+
+def test_publish_version_validates_graph_and_keeps_old_version_immutable(client):
+    tpl = _make_template(client)
+    v1_keys = [t["key"] for t in client.get("/templates/etl/versions/1").json()["snapshot"]]
+
+    # 非法图：不产生新版本
+    r = client.post("/templates/etl/versions", json={"tasks": [{"key": "a", "deps": ["a"]}]})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "cycle_detected"
+    detail = client.get("/templates/etl").json()
+    assert detail["latest_version"] == 1
+
+    # 发布 v2 后，v1 快照不变（不可变）
+    client.post("/templates/etl/versions", json={"tasks": [{"key": "only", "payload": {"x": "${p}"}}]})
+    v1 = client.get("/templates/etl/versions/1").json()
+    assert [t["key"] for t in v1["snapshot"]] == v1_keys
+    assert v1["version"] == 1 and v1["parameters"] == ["bucket", "count", "source"]
+
+
+def test_get_template_version_not_found(client):
+    _make_template(client)
+    assert client.get("/templates/nope/versions/1").status_code == 404
+    r = client.get("/templates/etl/versions/99")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "template_version_not_found"
+    assert r.json()["error"]["details"] == {"template_name": "etl", "version": 99}
+    # 非整数版本号由路由层 422
+    assert client.get("/templates/etl/versions/x").status_code == 422
+
+
+def test_instantiate_substitutes_placeholders_and_creates_dag(client):
+    _make_template(client)
+    r = _instantiate(client, "etl", 1, "run-1",
+                     {"source": "db-main", "count": 5, "bucket": "b1"})
+    assert r.status_code == 201, r.text
+    dag = r.json()
+    extract = by_key(dag, "extract")
+    load = by_key(dag, "load")
+    # 整体占位符保留参数原类型（数字仍是数字）
+    assert extract["payload"] == {"src": "db-main", "count": 5, "path": "s3://b1/data"}
+    # 依赖、能力路由与直接提交口径一致
+    assert load["deps"] == ["extract"] and load["requires"] == ["io"]
+    assert dag["states"]["pending"] == 2
+
+    # 实例 DAG 可走既有接口：GET /dags、领取（requires 同样生效）
+    assert client.get(f"/dags/{dag['id']}").json()["id"] == dag["id"]
+    assert client.post("/tasks/claim", json={"dag_id": dag["id"], "limit": 10}).json()["count"] == 1
+
+
+def test_instantiate_embedded_placeholder_stringifies(client):
+    _make_template(
+        client, name="embed",
+        tasks=[{"key": "a", "payload": {"url": "q=${x}&y", "both": "${x}${y}"}}],
+    )
+    r = _instantiate(client, "embed", 1, "k", {"x": 7, "y": ["z"]})
+    assert r.status_code == 201
+    payload = by_key(r.json(), "a")["payload"]
+    # 嵌入位置的非字符串参数按 JSON 文本替换
+    assert payload == {"url": 'q=7&y', "both": '7["z"]'}
+
+
+def test_instantiate_nested_payload_placeholders(client):
+    _make_template(
+        client, name="nested",
+        tasks=[{"key": "a", "payload": {"layers": [{"cfg": {"target": "${target}"}}], "flag": "${flag}"}}],
+    )
+    r = _instantiate(client, "nested", 1, "k", {"target": "gpu", "flag": True})
+    assert r.status_code == 201
+    payload = by_key(r.json(), "a")["payload"]
+    assert payload == {"layers": [{"cfg": {"target": "gpu"}}], "flag": True}
+
+
+def test_instantiate_requires_idempotency_key(client):
+    _make_template(client)
+    r = client.post("/templates/etl/versions/1/instantiations",
+                    json={"parameters": {"source": "s", "count": 1, "bucket": "b"}})
+    assert r.status_code == 422
+
+
+def test_instantiate_missing_parameter_422_and_no_persistence(client):
+    _make_template(client)
+    r = _instantiate(client, "etl", 1, "run-x", {"source": "s", "count": 1})
+    assert r.status_code == 422
+    err = r.json()["error"]
+    assert err["code"] == "missing_template_parameter"
+    assert err["details"]["missing"] == ["bucket"]
+
+    # 缺参不落库：失败后无 DAG、无事件
+    assert client.get("/events").json()["events"] == []
+    # 同键随后可用正确参数首次创建（证明未占位幂等记录）
+    r2 = _instantiate(client, "etl", 1, "run-x",
+                      {"source": "s", "count": 1, "bucket": "b"})
+    assert r2.status_code == 201
+    assert client.get(f"/dags/{r2.json()['id']}").status_code == 200
+
+
+def test_instantiate_unexpected_parameter_422_and_no_persistence(client):
+    _make_template(client)
+    r = _instantiate(client, "etl", 1, "run-y",
+                     {"source": "s", "count": 1, "bucket": "b", "extra": 9})
+    assert r.status_code == 422
+    err = r.json()["error"]
+    assert err["code"] == "unexpected_template_parameter"
+    assert err["details"]["unexpected"] == ["extra"]
+    assert client.get("/events").json()["events"] == []
+    # 无实例 DAG 落库
+    assert client.get("/tasks", params={"state": "pending"}).json()["count"] == 0
+
+
+def test_instantiate_no_placeholders_accepts_only_empty_parameters(client):
+    _make_template(client, name="plain", tasks=[{"key": "a", "payload": {"v": 1}}])
+    assert _instantiate(client, "plain", 1, "k", {}).status_code == 201
+    # 多参仍 422
+    r = _instantiate(client, "plain", 1, "k2", {"nope": 1})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "unexpected_template_parameter"
+    # 不传 parameters 字段等价于空参数
+    r2 = client.post("/templates/plain/versions/1/instantiations", json={"idempotency_key": "k3"})
+    assert r2.status_code == 201
+
+
+def test_instantiate_unknown_template_or_version_404(client):
+    _make_template(client)
+    r = _instantiate(client, "ghost", 1, "k", {})
+    assert r.status_code == 404 and r.json()["error"]["code"] == "template_not_found"
+    r = _instantiate(client, "etl", 99, "k", {})
+    assert r.status_code == 404 and r.json()["error"]["code"] == "template_version_not_found"
+    assert client.get("/events").json()["events"] == []
+
+
+def test_instantiate_idempotent_replay_returns_same_dag(client):
+    _make_template(client)
+    params = {"source": "db", "count": 3, "bucket": "b1"}
+    r1 = _instantiate(client, "etl", 1, "same-key", params)
+    assert r1.status_code == 201
+    first = r1.json()
+
+    # 键序不同的等价参数：重放返回同一 DAG，200
+    r2 = _instantiate(client, "etl", 1, "same-key",
+                      {"bucket": "b1", "count": 3, "source": "db"})
+    assert r2.status_code == 200
+    assert r2.json()["id"] == first["id"]
+
+    # 只产生一次 dag.created 事件、一个 DAG
+    events = client.get("/events").json()["events"]
+    assert len(events) == 1 and events[0]["type"] == "dag.created"
+    assert client.get("/tasks", params={"dag_id": first["id"]}).json()["count"] == 2
+
+    # 重放不带 parameters（缺参）仍 422，而不是返回首响
+    r3 = client.post("/templates/etl/versions/1/instantiations",
+                     json={"idempotency_key": "same-key", "parameters": {}})
+    assert r3.status_code == 422 and r3.json()["error"]["code"] == "missing_template_parameter"
+
+
+def test_instantiate_same_key_different_parameters_conflict(client):
+    _make_template(client)
+    base = {"source": "db", "count": 3, "bucket": "b1"}
+    assert _instantiate(client, "etl", 1, "dup-key", base).status_code == 201
+
+    r = _instantiate(client, "etl", 1, "dup-key", {**base, "source": "other"})
+    assert r.status_code == 409
+    err = r.json()["error"]
+    assert err["code"] == "idempotency_conflict"
+    assert err["details"] == {"template_name": "etl", "version": 1, "idempotency_key": "dup-key"}
+
+    # 冲突不落第二个 DAG
+    assert len([e for e in client.get("/events").json()["events"] if e["type"] == "dag.created"]) == 1
+
+    # 原参数仍可重放到同一 DAG
+    replay = _instantiate(client, "etl", 1, "dup-key", base)
+    assert replay.status_code == 200
+
+
+def test_instantiate_same_key_scoped_by_template_and_version(client):
+    _make_template(client)
+    client.post("/templates/etl/versions", json={"tasks": [{"key": "only", "payload": {"p": "${p}"}}]})
+    _make_template(client, name="other", tasks=[{"key": "a", "payload": {"q": "${q}"}}])
+
+    shared_key = "shared"
+    r1 = _instantiate(client, "etl", 1, shared_key,
+                      {"source": "s", "count": 1, "bucket": "b"})
+    r2 = _instantiate(client, "etl", 2, shared_key, {"p": "v"})
+    r3 = _instantiate(client, "other", 1, shared_key, {"q": "v"})
+    assert r1.status_code == 201 and r2.status_code == 201 and r3.status_code == 201
+    ids = {r1.json()["id"], r2.json()["id"], r3.json()["id"]}
+    assert len(ids) == 3
+    # 各自重放均命中自己的 DAG
+    assert _instantiate(client, "etl", 2, shared_key, {"p": "v"}).json()["id"] == r2.json()["id"]
+
+
+def test_instantiate_custom_dag_id_and_name(client):
+    _make_template(client, name="named", tasks=[{"key": "a", "payload": {"p": "${p}"}}])
+    r = _instantiate_named(client, "named", 1, "k", {"p": "v"},
+                           dag_name="run-42", dag_id="custom-dag-id")
+    assert r.status_code == 201
+    assert r.json()["id"] == "custom-dag-id" and r.json()["name"] == "run-42"
+
+    # 自定义 id 已存在：409 且不写幂等记录（可换 id 用同键重试）
+    r2 = _instantiate(client, "named", 1, "k2", {"p": "w"}, id="custom-dag-id")
+    assert r2.status_code == 409 and r2.json()["error"]["code"] == "dag_exists"
+    r3 = _instantiate(client, "named", 1, "k2", {"p": "w"})
+    assert r3.status_code == 201
+
+
+def test_instantiate_concurrency_group_conflict_rolls_back(client):
+    _make_template(
+        client, name="grp",
+        tasks=[{"key": "a", "concurrency_group": "g", "concurrency_limit": 2}],
+    )
+    # 先由直接提交持久化同名组上限 1
+    submit(client, [{"key": "x", "concurrency_group": "g", "concurrency_limit": 1}], dag_id="d-other")
+
+    # 模板版本声明上限 2：首个实例即命中跨 DAG 组冲突 —— 409，DAG 与幂等记录一同回滚
+    r = _instantiate(client, "grp", 1, "g1", {})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "concurrency_group_conflict"
+    # 无残留实例（只有 d-other 一个 DAG 的任务）
+    assert {t["dag_id"] for t in client.get("/tasks").json()["tasks"]} == {"d-other"}
+    # 无 dag.created 残留于失败实例：事件总数即 d-other 的一条
+    assert [e["dag_id"] for e in client.get("/events").json()["events"]] == ["d-other"]
+    # 同键在冲突解除后可重试（证明幂等记录已随事务回滚，没有占位）：
+    # 发布与持久化上限一致的新版本再实例化成功
+    client.post("/templates/grp/versions",
+                json={"tasks": [{"key": "a", "concurrency_group": "g", "concurrency_limit": 1}]})
+    r2 = _instantiate(client, "grp", 2, "g1", {})
+    assert r2.status_code == 201
+
+
+def test_instantiate_concurrent_same_key_creates_one_dag(client):
+    _make_template(client, name="conc", tasks=[{"key": "a", "payload": {"p": "${p}"}}])
+    responses = []
+    winning_param = []
+    errors = []
+    lock = threading.Lock()
+
+    def worker(i):
+        try:
+            param = {"p": f"v-{i}"}
+            r = _instantiate(client, "conc", 1, "race-key", param)
+            with lock:
+                responses.append(r)
+                if r.status_code == 201:
+                    winning_param.append(param)
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert not errors
+    # 同键并发：恰有一个请求创建 DAG（201），其余因参数指纹不同 409——
+    # 保留锁串行化裁决，绝不允许创建出多个 DAG
+    statuses = [r.status_code for r in responses]
+    assert statuses.count(201) == 1
+    assert set(statuses) <= {201, 409}
+    assert len(winning_param) == 1
+    dag_events = [e for e in client.get("/events", params={"limit": 100}).json()["events"]
+                  if e["type"] == "dag.created"]
+    assert len(dag_events) == 1
+    # 用创建时实际生效的参数重放：命中同一 DAG
+    created = next(r for r in responses if r.status_code == 201)
+    replay = _instantiate(client, "conc", 1, "race-key", winning_param[0])
+    assert replay.status_code == 200 and replay.json()["id"] == created.json()["id"]
+
+
+def test_instantiate_concurrent_same_key_same_params_single_dag(client):
+    _make_template(client, name="conc2", tasks=[{"key": "a", "payload": {"p": "${p}"}}])
+    statuses = []
+    dag_ids = []
+    barrier = threading.Barrier(6)
+
+    def worker():
+        barrier.wait()
+        r = _instantiate(client, "conc2", 1, "same-params", {"p": "v"})
+        statuses.append(r.status_code)
+        if r.status_code in (200, 201):
+            dag_ids.append(r.json()["id"])
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert 201 in statuses and set(statuses) <= {200, 201}
+    assert len(set(dag_ids)) == 1
+
+
+def test_templates_persist_across_restart(tmp_path, monkeypatch):
+    """模板、版本快照与幂等记录持久化在 SQLite：重启后语义不变。"""
+    db_file = tmp_path / "templates.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c1:
+        _make_template(c1)
+        r1 = _instantiate(c1, "etl", 1, "persist-key",
+                          {"source": "db", "count": 2, "bucket": "b"})
+        assert r1.status_code == 201
+        dag_id = r1.json()["id"]
+
+    with TestClient(app) as c2:
+        # 版本与快照仍可读且不可变
+        v1 = c2.get("/templates/etl/versions/1").json()
+        assert v1["parameters"] == ["bucket", "count", "source"]
+        assert len(v1["snapshot"]) == 2
+        # 幂等重放仍返回同一 DAG
+        r2 = _instantiate(c2, "etl", 1, "persist-key",
+                          {"source": "db", "count": 2, "bucket": "b"})
+        assert r2.status_code == 200 and r2.json()["id"] == dag_id
+        # 同键不同参数仍 409
+        r3 = _instantiate(c2, "etl", 1, "persist-key",
+                          {"source": "db2", "count": 2, "bucket": "b"})
+        assert r3.status_code == 409
+        # 重启后仍可发布新版本
+        r4 = c2.post("/templates/etl/versions", json={"tasks": [{"key": "z"}]})
+        assert r4.status_code == 201 and r4.json()["version"] == 2
+
+
+def test_placeholder_names_extracted_from_values_only(client):
+    # 对象键中的 ${...} 不是占位符（只替换 payload 值），参数要求只来自值
+    tpl = _make_template(
+        client, name="keys",
+        tasks=[{"key": "a", "payload": {"${only_in_key}": "v", "real": "${real}"}}],
+    )
+    assert tpl["parameters"] == ["real"]
+    r = _instantiate(client, "keys", 1, "k", {"real": "ok"})
+    assert r.status_code == 201
+    payload = by_key(r.json(), "a")["payload"]
+    assert payload == {"${only_in_key}": "v", "real": "ok"}
+
+
+def test_illegal_placeholder_shapes_are_literal(client):
+    # ${}、${1a}、${a-b} 不匹配占位符语法：不要求参数，原样保留
+    tpl = _make_template(
+        client, name="lit",
+        tasks=[{"key": "a", "payload": {"x": "${}", "y": "${1a}", "z": "${a-b}"}}],
+    )
+    assert tpl["parameters"] == []
+    r = _instantiate(client, "lit", 1, "k", {})
+    assert r.status_code == 201
+    assert by_key(r.json(), "a")["payload"] == {"x": "${}", "y": "${1a}", "z": "${a-b}"}
+
+
+def test_direct_dag_submit_unchanged_with_templates(client):
+    """新增模板模块不改变直接 POST /dags 的行为与响应结构。"""
+    dag = submit(client, [{"key": "a", "payload": "${not_replaced}"}])
+    # 直接提交不做占位符替换
+    assert by_key(dag, "a")["payload"] == "${not_replaced}"
+    _make_template(client, name="t")
+    dag2 = submit(client, [{"key": "a"}])
+    assert set(dag2.keys()) == set(dag.keys())
+    assert dag2["states"]["pending"] == 1
+
+
+def test_template_endpoints_in_openapi(client):
+    spec = client.get("/openapi.json").json()
+    paths = spec["paths"]
+    assert "post" in paths["/templates"]
+    assert "get" in paths["/templates"]
+    assert "get" in paths["/templates/{name}"]
+    assert "post" in paths["/templates/{name}/versions"]
+    assert "get" in paths["/templates/{name}/versions/{version}"]
+    inst = paths["/templates/{name}/versions/{version}/instantiations"]["post"]
+    assert {"200", "201", "404", "409", "422"} <= set(inst["responses"])
+    create = paths["/templates"]["post"]
+    assert {"201", "409", "422"} <= set(create["responses"])
+    # 既有接口仍在文档中
+    assert "post" in paths["/dags"]
+
